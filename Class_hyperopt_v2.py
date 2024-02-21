@@ -51,7 +51,7 @@ def init_pretained_model(arch):
     dummy_input = tf.zeros([1, sequence_length], dtype=tf.int32)  # 假设输入是整数类型的token索引
     
     # 创建虚拟的adjoin_matrix和mask
-    dummy_adjoin_matrix = tf.zeros([1, sequence_length, sequence_length], dtype=tf.float32)  # 根据实际需要可能需要调整类型
+    dummy_adjoin_matrix = tf.zeros([1, sequence_length, sequence_length], dtype=tf.float32)  
     dummy_mask = tf.ones([1, sequence_length], dtype=tf.bool)  # 假设所有位置都是有效的
     dummy_mask = tf.where(dummy_mask, -1e9, 0.0)
     # 使用虚拟输入调用模型
@@ -74,7 +74,7 @@ def transfer_pretrained_encoder_weights(source_model, pretraining: bool):
     dense_dropout = 0.1
     sequence_length = 128
     label = ['standard_value']
-    # 假设源模型和目标模型的编码器权重是直接兼容的
+
     # 初始化目标模型
     target_model = PredictModel(num_layers=num_layers, d_model=d_model, dff=dff,
                                 num_heads=num_heads, vocab_size=vocab_size,
@@ -170,11 +170,47 @@ def validate_epoch(label, model, val_dataset, auc_metrics):
     return y_true, y_preds, np.nanmean(auc_values), {i: auc_value for i, auc_value in enumerate(auc_values)}
 
 def evaluate_test(test_dataset, FTmodel, label):
-    y_true = {}
-    y_preds = {}
-    for i in range(len(label)):  #这里是为了把y_true变成{[],[],...}这种格式
-        y_true[i] = []
-        y_preds[i] = []
+    y_true = {i: [] for i in range(len(label))}
+    y_preds = {i: [] for i in range(len(label))}
+
+    for x, adjoin_matrix, y in test_dataset:
+        seq = tf.cast(tf.math.equal(x, 0), tf.float32)
+        mask = seq[:, tf.newaxis, tf.newaxis, :]
+        preds = FTmodel(x, mask=mask, adjoin_matrix=adjoin_matrix, training=False)
+        for i in range(len(label)):
+            y_true[i].append(y[:, i].numpy())  # 直接将TF张量转换为NumPy数组
+            y_preds[i].append(preds[:, i].numpy())
+
+    auc_list = []
+    test_y_t = []
+    test_y_p = []
+    for i in range(len(label)):
+        # 直接合并所有批次的真实标签和预测结果
+        y_label = np.concatenate(y_true[i])
+        y_pred = np.concatenate(y_preds[i])
+
+        validId = np.where((y_label == 0) | (y_label == 1))[0]
+        if len(validId) == 0 or np.unique(y_label[validId]).size < 2:
+            auc_list.append(float('nan'))
+            continue
+        
+        # 对有效标签计算AUC
+        y_t = y_label[validId]
+        y_p = tf.sigmoid(y_pred[validId]).numpy()
+        
+        AUC = sklearn.metrics.roc_auc_score(y_t, y_p)
+        auc_list.append(AUC)
+        test_y_t.append(y_t)
+        test_y_p.append(y_p)
+
+    test_auc = np.nanmean(auc_list)
+    print('test auc for best model:{:.4f}'.format(test_auc))
+    return test_auc, auc_list, test_y_t, test_y_p
+
+
+def evaluate_test(test_dataset, FTmodel, label):
+    y_true = {i: [] for i in range(len(label))}
+    y_preds = {i: [] for i in range(len(label))}
 
     for x, adjoin_matrix, y in test_dataset:
         seq = tf.cast(tf.math.equal(x, 0), tf.float32)
@@ -190,14 +226,11 @@ def evaluate_test(test_dataset, FTmodel, label):
     test_y_t = []
     test_y_p = []
     for i in range(len(label)):
-        # 合并所有批次的真实标签和预测结果
         try:
             y_label = np.concatenate([np.array(batch[i]) for batch in y_true if np.array(batch[i]).ndim != 0])
             y_pred = np.concatenate([np.array(batch[i]) for batch in y_preds if np.array(batch[i]).ndim != 0])
         except:
-            # 合并第i个标签的所有批次的真实值
             y_label = np.concatenate(y_true[i])
-            # 合并第i个标签的所有批次的预测值
             y_pred = np.concatenate(y_preds[i])
         
         validId = np.where((y_label == 0) | (y_label == 1))[0]
@@ -223,8 +256,6 @@ def evaluate_test(test_dataset, FTmodel, label):
 def main(task, label, seed, args, FTmodel, pretraining=True):
     pretraining_str = 'pretraining' if pretraining else ''
     
-    
-
     num_heads, dense_dropout, learning_rate, batch_size = load_hyperparam(args)
     
     #环境初始化
@@ -232,18 +263,12 @@ def main(task, label, seed, args, FTmodel, pretraining=True):
     tf.random.set_seed(seed=seed)
 
     train_dataset, test_dataset, val_dataset = load_dataset(task, batch_size, label, seed)
-
-    # 第一次反向传播 #但是有必要在这里计算吗？
-    # x, adjoin_matrix, y = next(iter(train_dataset.take(1)))
-    # mask = tf.cast(tf.math.equal(x, 0), tf.float32)[:, tf.newaxis, tf.newaxis, :]
-
     
     total_params = count_parameters(FTmodel)
     print('*'*100)
     print("Total Parameters:", total_params)
     print('*'*100)
     
-    # def init_train(learning_rate)----
     # 定义模型、优化器和损失函数
     optimizer = tf.keras.optimizers.Adam(learning_rate=learning_rate)
     loss_object = tf.keras.losses.BinaryCrossentropy(from_logits=True)
@@ -255,10 +280,8 @@ def main(task, label, seed, args, FTmodel, pretraining=True):
 
     # 初始化二分类AUC计算器：假设有一个二分类问题或多个二分类标签
     # 注意：
-    # 如果模型输出是 logits（即未经过 sigmoid 或 softmax 激活的原始输出），请确保在初始化 tf.keras.metrics.AUC 时设置 from_logits=True。
-    # 如果模型输出已经是概率（经过了激活函数处理），应将其设置为 False。
+    # 模型输出是 logits（即未经过 sigmoid 或 softmax 激活的原始输出），因此在初始化 tf.keras.metrics.AUC 时设置 from_logits=True。
     auc_metrics = [tf.keras.metrics.AUC(from_logits=True) for _ in range(len(label))]
-    # -----
 
     best_val_auc = -10
     train_loss = []
@@ -275,34 +298,6 @@ def main(task, label, seed, args, FTmodel, pretraining=True):
         
         train_loss.append(epoch_train_loss)
         val_auc_list.append(epoch_val_auc)
-        # y_true = {}
-        # y_preds = {}
-        # for i in range(len(label)):
-        #     y_true[i] = []
-        #     y_preds[i] = []
-        # for x, adjoin_matrix, y in val_dataset:
-        #     seq = tf.cast(tf.math.equal(x, 0), tf.float32)
-        #     mask = seq[:, tf.newaxis, tf.newaxis, :]
-        #     preds = FTmodel(x, mask=mask, adjoin_matrix=adjoin_matrix, training=False)
-            
-        #     # 优化：使用 TensorFlow 的 tf.keras.metrics.AUC 可以自动处理 AUC 的计算，包括正确处理批次间的状态累积。
-        #     for i, auc_metric in enumerate(auc_metrics):
-        #         # 更新 AUC 计算器
-        #         valid_mask = (y[:, i] == 0) | (y[:, i] == 1)
-        #         auc_metric.update_state(y[:, i][valid_mask], preds[:, i][valid_mask])
-        
-        # # 计算并打印每个标签的 AUC
-        # auc_values = [metric.result().numpy() for metric in auc_metrics]
-        # for i, auc_value in enumerate(auc_values):
-        #     print(f"Label {i} valid AUC: {auc_value}")
-        # #计算总体的AUC
-        # AUC_all = np.nanmean(auc_values)
-        # 
-        # print('val auc:{:.4f}'.format(AUC_all))
-
-        # # 在每个 epoch 结束时重置 AUC 计算器
-        # for auc_metric in auc_metrics:
-        #     auc_metric.reset_states()
 
         # 检查是否应该早停
         if epoch_val_auc > best_val_auc:
@@ -399,22 +394,6 @@ def score(y_test, y_pred):
     BA = (se + sp) / 2
     return tp, tn, fn, fp, se, sp, mcc, q, auc_roc_score, F1, BA, prauc
 
-
-# def score_all(args):  #实际上，这里只需要接收的参数是args里面的训练参数以及得到的y_true_final, y_pred_final（这个可以另外传进来）
-#     idx = 0
-#     for seed in [1]:  #多个seed有多个结果的没必要重复计算，而是应该在
-#         print(seed)
-#         auc, test_auc, a_list, y_true_final, y_pred_final = main(seed, args)
-#         if idx == 0:
-#             writer.writerow(['tasks', 'tp', 'tn', 'fn',
-#                              'fp', 'se', 'sp', 'mcc', 'q', 'auc_roc_score', 'F1', 'BA', 'prauc',
-#                              'num_heads', "batch_size", "learning_rate", "dense_dropout"])
-#             idx = 1
-#         tp, tn, fn, fp, se, sp, mcc, q, auc_roc_score, F1, BA, prauc = score(y_true_final, y_pred_final)
-#         writer.writerow([task, tp, tn, fn, fp, se, sp, mcc, q, auc_roc_score, F1, BA, prauc,
-#                          args["num_heads"], args["batch_size"], args["learning_rate"], args["dense_dropout"]])
-#     return None
-
 # 检查文件是否存在且具有要求的标题行，如果没有该文件/该标题行，则创建一个具有要求的标题行的文件
 def check_header(file_path, expected_header):
     # 检查文件是否存在
@@ -465,7 +444,7 @@ if __name__ == "__main__":
     print("Best Test AUC:", best_model_wrapper.best_auc)
     print("Best Hyperparameters:", best_model_wrapper.best_params)
     
-    a = [64,128,256]
+    a = [8, 16, 32, 48, 64]
     b = [4, 8]
     # 使用字典推导和条件表达式简化赋值过程
     best_dict = {
